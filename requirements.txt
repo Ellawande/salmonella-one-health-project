@@ -7,6 +7,7 @@ numpy>=1.24
 
 # genome / sequence analysis
 biopython>=1.81
+scikit-bio>=0.6         # diversity, distance matrices, NJ trees
 sourmash>=4.8          # MinHash ANI
 pyfamsa>=0.3           # multiple sequence alignment (FAMSA)
 pyrodigal>=3.0         # gene prediction (Prodigal)
@@ -15,6 +16,7 @@ parasail>=1.3          # pairwise sequence alignment (homology verification)
 
 # statistics and visualisation
 scipy>=1.11
+statsmodels>=0.14       # multiple-testing correction (BH FDR)
 matplotlib>=3.7
 seaborn>=0.13
 
