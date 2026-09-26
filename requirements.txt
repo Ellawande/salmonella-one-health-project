@@ -1,0 +1,26 @@
+# Salmonella One Health — pipeline dependencies
+# Install with:  pip install -r requirements.txt
+
+# core data handling
+pandas>=2.0
+numpy>=1.24
+
+# genome / sequence analysis
+biopython>=1.81
+sourmash>=4.8          # MinHash ANI
+pyfamsa>=0.3           # multiple sequence alignment (FAMSA)
+pyrodigal>=3.0         # gene prediction (Prodigal)
+pyhmmer>=0.10          # Pfam / HMM domain annotation
+parasail>=1.3          # pairwise sequence alignment (homology verification)
+
+# statistics and visualisation
+scipy>=1.11
+matplotlib>=3.7
+seaborn>=0.13
+
+# interactive dashboard
+streamlit>=1.30
+plotly>=5.18
+
+# data acquisition
+requests>=2.31

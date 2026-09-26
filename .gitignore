@@ -1,0 +1,36 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# --- Raw sequence data (large; regenerate with scripts/01_fetch_isolates.py) ---
+# Genome FASTA files are downloaded on demand, not committed.
+data/raw/*.fna
+data/raw/*.fasta
+data/raw/*.faa
+data/raw/*.gz
+
+# --- Downloaded reference databases (large; auto-fetched) ---
+# CARD, VFDB, PlasmidFinder and Pfam-A are downloaded by their scripts on first run.
+*.hmm
+*.h3m
+refdb/
+
+# --- Derived per-genome intermediates (regenerable) ---
+proteins/*.faa
+proteins/*.ffn
+proteins/*.gff
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# --- Large generated matrices kept in results/ are committed if small (<5 MB).
+#     Override for a specific file if needed with:  git add -f results/<file>

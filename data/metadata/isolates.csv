@@ -1,0 +1,19 @@
+host_group,host,geo_loc_name,collection_date,serovar,asm_acc,number_amr_genes
+Human,Homo sapiens,USA,NULL,Enteritidis,GCA_011454775.1,3
+Human,Homo sapiens,Mexico,NULL,Typhimurium,GCA_010123015.1,2
+Human,Homo sapiens,France,1988,Saintpaul,GCA_010715595.1,7
+Human,Homo sapiens,NULL,1981,Limete,GCA_010716035.1,2
+Human,Homo sapiens,Haiti,2012,NULL,GCA_005675415.1,6
+Human,Homo sapiens,United Kingdom,1982,Paratyphi B,GCA_010123345.1,2
+Poultry,Gallus gallus domesticus,USA,2003-07-25,Montevideo,GCA_011457165.1,2
+Poultry,Gallus gallus,NULL,2003,Heidelberg,GCA_010714675.1,10
+Poultry,Chicken,United Kingdom,1995,Gallinarum,GCA_000192125.1,2
+Poultry,Gallus gallus,China,NULL,Enteritidis,GCA_000329025.1,3
+Poultry,Gallus gallus,Belgium,2010,Newport,GCA_008032345.1,2
+Poultry,Gallus gallus,Hungary,2004,Infantis,GCA_000812595.1,6
+Cattle,Bos taurus,USA:SD,2006,NULL,GCA_006862905.1,2
+Cattle,bovine,France,NULL,Heidelberg,GCA_000258365.1,3
+Cattle,cattle,China: Shanghai,2010-10,Agona,GCA_000330625.1,10
+Cattle,Bos taurus,NULL,NULL,Typhimurium,GCA_000474395.1,14
+Cattle,Bos taurus,Belgium,2012,Enteritidis,GCA_008005965.1,2
+Cattle,Bos taurus,Canada: British Columbia,2009-07-16,Dublin,GCA_001448615.1,2
