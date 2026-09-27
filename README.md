@@ -16,9 +16,9 @@ produce the identical observation:
 1. **Vertical inheritance** — the isolates share a recent common ancestor that already carried the gene.
 2. **Horizontal gene transfer (HGT)** — the gene was acquired independently, in different lineages, in different hosts.
 
-This project distinguishes the two by testing each resistance gene against a **core-genome
-phylogeny**, using Fitch parsimony with a permutation null. The result is that resistance in
-these isolates is split roughly 2:1 between the two mechanisms — and the distinction changes
+This project attempts to distinguish the two by testing each resistance gene against a **core-genome
+phylogeny**, using Fitch parsimony with a permutation null. The result suggests that resistance in
+these isolates is split roughly 2:1 between the two mechanisms and the distinction changes
 the public-health interpretation completely.
 
 ---
@@ -214,22 +214,9 @@ python scripts/06_ani_and_amr_overlay.py
 streamlit run dashboard/app.py
 ```
 
-> Git operations are run by you in a terminal — this analysis was produced in a notebook
-> environment and the repository is prepared here as a complete, ready-to-commit project.
-
----
-
-## Next steps
+## Tentative Next Steps
 
 1. Scale the cohort to hundreds of isolates per host for population-level inference.
 2. Maximum-likelihood phylogeny with bootstrap support (IQ-TREE) + recombination detection.
 3. Plasmid binning to establish gene–plasmid linkage rather than co-occurrence.
 4. Statistical association testing corrected for population structure (clonality).
-
----
-
-## License
-
-MIT — see `LICENSE`.
-
-*Analyses performed with Omicsboard Lab.*
