@@ -69,12 +69,19 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import re
 import sys
 import urllib.request
 from collections import Counter
 from pathlib import Path
 
 import pandas as pd
+
+# Shared AMR classification lives in amr_common.py.  The path insert makes
+# the import work whether this file is run from the repo root or from scripts/.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from amr_common import INTRINSIC_MARKERS, is_acquired  # noqa: E402
+import tarfile
 
 # ----------------------------------------------------------------------------
 # Thresholds and scoring -- published conventions for each database
@@ -99,11 +106,14 @@ def repo_root() -> Path:
 # ----------------------------------------------------------------------------
 # Reference database acquisition
 # ----------------------------------------------------------------------------
+# Database hosts (mgc.ac.cn among them) answer 403 to the default urllib
+# user-agent, so every outbound request identifies itself as a browser.
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
 VFDB_URL = "http://www.mgc.ac.cn/VFs/Down/VFDB_setA_pro.fas.gz"
-PLASMIDFINDER_API = ("https://api.github.com/repos/genomicepidemiology/"
-                     "plasmidfinder_db/contents")
-PLASMIDFINDER_RAW = ("https://raw.githubusercontent.com/genomicepidemiology/"
-                     "plasmidfinder_db/master")
+PLASMIDFINDER_TARBALL = ("https://bitbucket.org/genomicepidemiology/"
+                         "plasmidfinder_db/get/master.tar.gz")
 CARD_INFO = "https://card.mcmaster.ca/latest/data"
 
 
@@ -123,7 +133,8 @@ def parse_fasta(text: str) -> list[tuple[str, str]]:
 
 
 def fetch_text(url: str, timeout: int = 300) -> str:
-    with urllib.request.urlopen(url, timeout=timeout) as r:
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         data = r.read()
     if url.endswith(".gz"):
         data = gzip.decompress(data)
@@ -138,27 +149,163 @@ def fetch_vfdb(cache: Path) -> list[tuple[str, str]]:
     return parse_fasta(target.read_text(encoding="utf-8", errors="replace"))
 
 
+# PlasmidFinder headers are <replicon>_<cluster>_<description>_<accession>, e.g.
+# IncC_1__JN157804, so the replicon type is the leading token up to the cluster
+# number. Entries with no cluster field (ColpEC648__CP008718) keep the whole
+# header as the name. Verified against all 10 replicon types in the published
+# results.
+REPLICON_NAME_RE = re.compile(r"^(?P<name>.+?)_(?P<cluster>\d+)_")
+
+
+def replicon_name(header: str) -> str:
+    m = REPLICON_NAME_RE.match(header)
+    return m.group("name") if m else header
+
+
 def fetch_plasmidfinder(cache: Path) -> list[tuple[str, str]]:
-    listing = cache / "plasmidfinder_files.json"
-    if not listing.exists():
-        print("  fetching PlasmidFinder file listing ...")
-        with urllib.request.urlopen(PLASMIDFINDER_API, timeout=120) as r:
-            payload = json.load(r)
-        names = [e["name"] for e in payload if e["name"].endswith(".fsa")]
-        listing.write_text(json.dumps(names), encoding="utf-8")
-    names = json.loads(listing.read_text(encoding="utf-8"))
+    """PlasmidFinder replicon sequences.
+
+    The database moved from GitHub to Bitbucket: the old GitHub contents
+    listing now returns 404. We therefore take the whole repository tarball in
+    one request rather than listing files and fetching them one by one.
+    """
+    archive = cache / "plasmidfinder_db.tar.gz"
+    if not archive.exists():
+        print("  fetching PlasmidFinder database ...")
+        try:
+            req = urllib.request.Request(PLASMIDFINDER_TARBALL,
+                                         headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=300) as r:
+                archive.write_bytes(r.read())
+        except Exception as exc:
+            raise SystemExit(
+                "ERROR: could not download the PlasmidFinder database.\n"
+                f"  {PLASMIDFINDER_TARBALL}\n  -> {exc}\n"
+                f"  Download it manually and save it as {archive}"
+            ) from exc
 
     seqs: list[tuple[str, str]] = []
-    for name in names:
-        local = cache / name
-        if not local.exists():
-            local.write_text(fetch_text(f"{PLASMIDFINDER_RAW}/{name}"),
-                             encoding="utf-8")
-        # the FILE name IS the replicon type (IncFII.fsa -> IncFII)
-        replicon = name[:-4]
-        for _, s in parse_fasta(local.read_text(encoding="utf-8", errors="replace")):
-            seqs.append((replicon, s))
+    with tarfile.open(archive, "r:gz") as tar:
+        for member in tar.getmembers():
+            if not member.isfile() or not member.name.endswith(".fsa"):
+                continue
+            text = tar.extractfile(member).read().decode("utf-8", errors="replace")
+            # The replicon type comes from the HEADER (see replicon_name above),
+            # not the file name: the database now groups sequences into a handful
+            # of files such as enterobacteriales.fsa.
+            for header, s in parse_fasta(text):
+                seqs.append((replicon_name(header), s))
     return seqs
+
+
+# --- annotation helpers -------------------------------------------------------
+# CARD's model FASTA carries only sequences; the fields that say WHAT a hit
+# confers live in aro_index.tsv. VFDB encodes its own annotation in the FASTA
+# header. Neither was being read, so the published tables could not be
+# regenerated. These helpers recover both, plus host_group from the metadata.
+
+HIT_COLUMNS = ("strain", "query", "database", "gene", "identity_%", "coverage_%",
+               "category", "product", "drug", "mech", "family")
+
+AMR_COLUMNS = HIT_COLUMNS + ("acquired",)
+
+REPLICON_COLUMNS = ("strain", "host_group", "replicon", "identity_%", "coverage_%")
+
+
+def resolve_card_dir(cache: Path) -> Path:
+    """CARD files: the project cache if populated, else the Omicsboard cache."""
+    if (cache / "aro_index.tsv").exists():
+        return cache
+    alt = Path.home() / ".omicsboard" / "amrdb" / "card"
+    if (alt / "aro_index.tsv").exists():
+        return alt
+    return cache
+
+
+def card_protein_fasta(cache: Path) -> Path:
+    """CARD ships the protein-homolog model under either of two filenames."""
+    for d in (cache, resolve_card_dir(cache)):
+        for name in ("card_protein.fasta",
+                     "protein_fasta_protein_homolog_model.fasta"):
+            if (d / name).exists():
+                return d / name
+    return cache / "card_protein.fasta"
+
+
+def load_card_meta(cache: Path) -> dict:
+    """ARO accession -> (drug class, resistance mechanism, AMR gene family).
+
+    Returns {} rather than raising when aro_index.tsv is missing, so the
+    script still runs -- with empty annotation columns and a loud warning.
+    """
+    idx = resolve_card_dir(cache) / "aro_index.tsv"
+    if not idx.exists():
+        return {}
+    want = ("ARO Accession", "Drug Class", "Resistance Mechanism", "AMR Gene Family")
+    meta = {}
+    with idx.open(encoding="utf-8", errors="replace") as fh:
+        header = fh.readline().rstrip("\n").split("\t")
+        if not all(w in header for w in want):
+            return {}
+        i_acc, i_drug, i_mech, i_fam = (header.index(w) for w in want)
+        widest = max(i_acc, i_drug, i_mech, i_fam)
+        for line in fh:
+            f = line.rstrip("\n").split("\t")
+            if len(f) <= widest:
+                continue
+            meta[f[i_acc].strip()] = (f[i_drug].strip(), f[i_mech].strip(),
+                                      f[i_fam].strip())
+    return meta
+
+
+def card_fields(reference: str, card_meta: dict) -> dict:
+    """Gene name + CARD annotation for one hit, from its FASTA header."""
+    parts = reference.split("|")
+    gene = parts[3].split()[0] if len(parts) > 3 else reference.split()[0]
+    m = re.search(r"ARO:\d+", reference)
+    drug, mech, family = card_meta.get(m.group(0), ("", "", "")) if m else ("", "", "")
+    return {"gene": gene, "category": "", "product": "",
+            "drug": drug, "mech": mech, "family": family}
+
+
+def vfdb_fields(reference: str) -> dict:
+    """VFDB annotates inside the FASTA header, e.g.
+    VFG037176(gb|WP_001081735) (plc1) phospholipase C [Phospholipase C (VF0470) - Exotoxin (VFC0235)] [organism]
+    -> gene 'gb|WP_001081735', product '(plc1) phospholipase C', category 'Exotoxin'.
+    """
+    m = re.search(r"\((gb\|[A-Za-z0-9._]+)\)", reference)
+    gene = m.group(1) if m else reference.split()[0]
+    rest = reference[m.end():].strip() if m else ""
+    product = rest.split("[")[0].strip()
+    category = ""
+    cm = re.search(r"\[([^\]]+)\]", rest)
+    if cm:
+        c = cm.group(1).strip()
+        if " - " in c:
+            c = c.split(" - ")[-1]
+        category = re.sub(r"\s*\(VFC\d+\)\s*$", "", c).strip()
+    return {"gene": gene, "category": category, "product": product,
+            "drug": "", "mech": "", "family": ""}
+
+
+def load_host_groups(metadata: Path, out: Path) -> dict:
+    """asm_acc -> host_group, so replicons can be compared across host groups."""
+    for p in (metadata, out / "isolates_selected.csv"):
+        if not p.exists():
+            continue
+        with p.open(encoding="utf-8", errors="replace") as fh:
+            header = fh.readline().rstrip("\n").split(",")
+            if "asm_acc" not in header or "host_group" not in header:
+                continue
+            i_acc, i_host = header.index("asm_acc"), header.index("host_group")
+            widest = max(i_acc, i_host)
+            groups = {}
+            for line in fh:
+                f = line.rstrip("\n").split(",")
+                if len(f) > widest:
+                    groups[f[i_acc].strip()] = f[i_host].strip()
+            return groups
+    return {}
 
 
 def fetch_card(cache: Path) -> list[tuple[str, str]]:
@@ -168,7 +315,7 @@ def fetch_card(cache: Path) -> list[tuple[str, str]]:
     instructions rather than quietly returning an empty database (which would
     silently under-report resistance -- the worst possible failure mode here).
     """
-    prot = cache / "card_protein.fasta"
+    prot = card_protein_fasta(cache)
     if prot.exists():
         return parse_fasta(prot.read_text(encoding="utf-8", errors="replace"))
 
@@ -256,21 +403,56 @@ def screen(queries: list[tuple[str, str]],
            k: int, scores: dict,
            min_identity: float, min_coverage: float,
            prefilter: float = 0.20) -> list[dict]:
-    """Prefilter by shared k-mers, then verify the survivors by alignment."""
+    """Prefilter by shared k-mers, then verify the survivors by alignment.
+
+    The gate is |qset & rset| / |rset| >= prefilter. Testing it with a set
+    intersection for every query/reference pair is O(queries x refs) -- about
+    28 million intersections for one genome, which is ~6 minutes per genome
+    and over three hours for all eighteen.
+
+    An inverted index (k-mer -> the references carrying it) computes the SAME
+    shared count, because a pair can only pass the gate if it shares at least
+    one k-mer; pairs sharing none are zero and never get visited. Candidate
+    references are visited in their original ascending order, so the output is
+    identical to the naive version, only faster.
+    """
     ref_sets = [(label, seq, kmer_set(seq, k)) for label, seq in refs]
+    ref_len = [len(rset) for _, _, rset in ref_sets]
     hits: list[dict] = []
+
+    # prefilter <= 0 admits every pair, so no index could prune anything
+    if prefilter <= 0:
+        for qname, qseq in queries:
+            qset = kmer_set(qseq, k)
+            if not qset:
+                continue
+            for label, rseq, rset in ref_sets:
+                if not rset or len(qset & rset) / len(rset) < prefilter:
+                    continue
+                identity, coverage = align_identity_coverage(qseq, rseq, scores)
+                if identity >= min_identity and coverage >= min_coverage:
+                    hits.append({"reference": label,
+                                 "identity": round(identity, 3),
+                                 "coverage": round(coverage, 3)})
+        return hits
+
+    index: dict[str, list[int]] = {}
+    for i, (_, _, rset) in enumerate(ref_sets):
+        for km in rset:
+            index.setdefault(km, []).append(i)
 
     for qname, qseq in queries:
         qset = kmer_set(qseq, k)
         if not qset:
             continue
-        for label, rseq, rset in ref_sets:
-            if not rset:
+        shared: dict[int, int] = {}
+        for km in qset:
+            for i in index.get(km, ()):
+                shared[i] = shared.get(i, 0) + 1
+        for i in sorted(shared):
+            if shared[i] / ref_len[i] < prefilter:
                 continue
-            # --- cheap gate: too few shared k-mers to be worth aligning
-            if len(qset & rset) / len(rset) < prefilter:
-                continue
-            # --- verify with a real alignment
+            label, rseq, _ = ref_sets[i]
             identity, coverage = align_identity_coverage(qseq, rseq, scores)
             if identity >= min_identity and coverage >= min_coverage:
                 hits.append({"reference": label,
@@ -278,35 +460,15 @@ def screen(queries: list[tuple[str, str]],
                              "coverage": round(coverage, 3)})
     return hits
 
-
-# ----------------------------------------------------------------------------
-# Which CARD genes are ACQUIRED rather than intrinsic?
-# ----------------------------------------------------------------------------
-# Curated from the CARD classification and the ResFinder/AMRFinder literature.
-# Intrinsic genes are chromosomal in Salmonella and say little about a single
-# isolate; acquired genes are the transferable, clinically actionable ones.
-INTRINSIC_MARKERS = (
-    "aac(6')-iaa", "aac(6')-iay", "aac(6')-iz", "aac(6')-iic",
-    "mdtk", "mdfa", "acra", "acrb", "mara", "ramA", "soxs", "emrd", "emry",
-    "mdsabc", "tolc", "baea", "baer", "kdpe", "phop", "phoq",
-    "cpxa", "cpxr", "crp", "hfq", "roba", "sdia", "gadx", "gadw",
-    "ampr", "amps", "lpxc", "pmrf", "pmre", "ugd", "arna", "arnb",
-    "baca", "epta", "eptb", "mcr-9",
-)
-
-
-def is_acquired(label: str) -> bool:
-    """True if a CARD hit looks plasmid-/transposon-borne rather than intrinsic."""
-    low = label.lower()
-    return not any(marker in low for marker in INTRINSIC_MARKERS)
-
-
 def main() -> int:
     root = repo_root()
     ap = argparse.ArgumentParser(description="Screen genomes for AMR, virulence and replicons.")
     ap.add_argument("--genomes", type=Path, default=root / "data" / "raw")
     ap.add_argument("--out", type=Path, default=root / "results")
     ap.add_argument("--cache", type=Path, default=root / "refdb")
+    ap.add_argument("--metadata", type=Path,
+                    default=root / "data" / "metadata" / "isolates.csv",
+                    help="isolate metadata carrying host_group")
     ap.add_argument("--skip-card", action="store_true",
                     help="run only VFDB + PlasmidFinder")
     args = ap.parse_args()
@@ -325,14 +487,32 @@ def main() -> int:
     card = [] if args.skip_card else fetch_card(args.cache)
     vfdb = fetch_vfdb(args.cache)
     replicons = fetch_plasmidfinder(args.cache)
+
+    card_meta = load_card_meta(args.cache)
+    host_groups = load_host_groups(args.metadata, args.out)
+    if card and not card_meta:
+        print("  WARNING: aro_index.tsv not found -- CARD drug/mechanism/"
+              "family columns will be empty.")
     print(f"  CARD         : {len(card)} protein models")
     print(f"  VFDB         : {len(vfdb)} virulence factors")
     print(f"  PlasmidFinder: {len(replicons)} replicon alleles")
     print("-" * 74)
 
-    amr_rows, rep_rows = [], []
+    amr_rows, vir_rows, rep_rows = [], [], []
     for i, fasta in enumerate(genomes, 1):
         strain = fasta.stem
+
+        # Per-genome checkpoints: screening is ~4 min per genome, so a long run
+        # must be resumable rather than restartable. Completed genomes load back
+        # from disk instead of being recomputed.
+        ckpt = root / "data" / "amr_checkpoints"
+        ck_paths = {t: ckpt / f"{strain}.{t}.pkl" for t in ("amr", "vir", "rep")}
+        if all(q.exists() for q in ck_paths.values()):
+            amr_rows += pd.read_pickle(ck_paths["amr"]).to_dict("records")
+            vir_rows += pd.read_pickle(ck_paths["vir"]).to_dict("records")
+            rep_rows += pd.read_pickle(ck_paths["rep"]).to_dict("records")
+            print(f"genome {i} of {len(genomes)}: {strain} -- resumed from checkpoint")
+            continue
         proteins = call_genes(fasta)
 
         amr_hits = screen(proteins, card, PROTEIN_KMER, PROTEIN_SCORES,
@@ -351,45 +531,68 @@ def main() -> int:
               f"{len(rep_hits):>2} replicons")
 
         for h in amr_hits:
-            amr_rows.append({"strain": strain, "database": "CARD",
-                             "gene": h["reference"], "identity": h["identity"],
-                             "coverage": h["coverage"],
-                             "acquired": is_acquired(h["reference"])})
+            f = card_fields(h["reference"], card_meta)
+            amr_rows.append({"strain": strain, "query": h["reference"],
+                             "database": "CARD", "gene": f["gene"],
+                             "identity_%": h["identity"], "coverage_%": h["coverage"],
+                             "category": f["category"], "product": f["product"],
+                             "drug": f["drug"], "mech": f["mech"], "family": f["family"]})
         for h in vir_hits:
-            amr_rows.append({"strain": strain, "database": "VFDB",
-                             "gene": h["reference"], "identity": h["identity"],
-                             "coverage": h["coverage"], "acquired": None})
+            f = vfdb_fields(h["reference"])
+            vir_rows.append({"strain": strain, "query": h["reference"],
+                             "database": "VFDB", "gene": f["gene"],
+                             "identity_%": h["identity"], "coverage_%": h["coverage"],
+                             "category": f["category"], "product": f["product"],
+                             "drug": f["drug"], "mech": f["mech"], "family": f["family"]})
         for h in rep_hits:
-            rep_rows.append({"strain": strain, "replicon": h["reference"],
-                             "identity": h["identity"], "coverage": h["coverage"]})
+            rep_rows.append({"strain": strain, "host_group": host_groups.get(strain, ""),
+                             "replicon": h["reference"],
+                             "identity_%": h["identity"], "coverage_%": h["coverage"]})
 
-    amr_df = pd.DataFrame(amr_rows)
-    amr_path = args.out / "amr_hits.csv"
+
+        # write this genome's rows to disk immediately so a crash costs one genome
+        ckpt.mkdir(parents=True, exist_ok=True)
+        for t, rows in (("amr", amr_rows), ("vir", vir_rows), ("rep", rep_rows)):
+            sub = [r for r in rows if r["strain"] == strain]
+            pd.DataFrame(sub).to_pickle(ck_paths[t])
+    amr_df = pd.DataFrame(amr_rows).reindex(columns=HIT_COLUMNS)
+    # CARD-derived classification: acquired = transferable / plasmid-borne,
+    # intrinsic = chromosomal. Written into the table so consumers (script 06)
+    # read one source of truth instead of each re-deriving the flag privately.
+    amr_df["acquired"] = amr_df["gene"].map(is_acquired)
+    amr_df = amr_df.reindex(columns=AMR_COLUMNS)
+    amr_path = args.out / "amr_genes.csv"
     amr_df.to_csv(amr_path, index=False)
 
-    rep_df = pd.DataFrame(rep_rows)
-    rep_path = args.out / "plasmid_replicons.csv"
+    vir_df = pd.DataFrame(vir_rows).reindex(columns=HIT_COLUMNS)
+    vir_path = args.out / "virulence_genes.csv"
+    vir_df.to_csv(vir_path, index=False)
+
+    rep_df = pd.DataFrame(rep_rows).reindex(columns=REPLICON_COLUMNS)
+    rep_path = args.out / "plasmid_replicons_all.csv"
     rep_df.to_csv(rep_path, index=False)
 
     print("-" * 74)
-    print(f"AMR/VF hits : {len(amr_df):>5} rows -> {amr_path}")
+    print(f"CARD AMR hits: {len(amr_df)} rows -> {amr_path}")
     if not amr_df.empty:
-        acq = amr_df[amr_df["acquired"] == True]["gene"].nunique()
-        intr = amr_df[amr_df["acquired"] == False]["gene"].nunique()
-        print(f"  distinct acquired AMR genes : {acq}")
-        print(f"  distinct intrinsic AMR genes: {intr}")
-        top = Counter(amr_df[amr_df["acquired"] == True]["gene"]).most_common(5)
+        flags = amr_df["acquired"]
+        print(f"  distinct acquired AMR genes : {amr_df.loc[flags, 'gene'].nunique()}")
+        print(f"  distinct intrinsic AMR genes: {amr_df.loc[~flags, 'gene'].nunique()}")
+        top = Counter(amr_df.loc[flags, "gene"]).most_common(5)
         if top:
             print("  most widespread acquired genes:")
             for g, n in top:
-                print(f"     {g:<40} {n} isolates")
+                print(f"     {g} -- {n} isolates")
 
-    print(f"\nReplicon hits: {len(rep_df):>5} rows -> {rep_path}")
+    print(f"VFDB hits    : {len(vir_df)} rows -> {vir_path}")
+    if not vir_df.empty:
+        print(f"  distinct virulence genes: {vir_df['gene'].nunique()}")
+
+    print(f"Replicons    : {len(rep_df)} rows -> {rep_path}")
     if not rep_df.empty:
-        strains_with = rep_df["strain"].nunique()
-        print(f"  {strains_with}/{len(genomes)} isolates carry >=1 plasmid replicon")
+        print(f"  {rep_df['strain'].nunique()}/{len(genomes)} isolates carry a plasmid replicon")
         for rec, n in Counter(rep_df["replicon"]).most_common(5):
-            print(f"     {rec:<40} {n} isolates")
+            print(f"     {rec} -- {n} isolates")
     return 0
 
 

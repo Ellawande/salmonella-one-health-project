@@ -15,7 +15,7 @@ THE IDEA
     gene appears once and is passed down, a "clumped" pattern.
 
     If a gene moves horizontally, it will show up in distantly related
-    isolates, requiring MANY changes of state -- a "dispersed" pattern.
+    isolates, requiring MANY changes of state -- a "scattered" pattern.
 
     To decide whether "many" or "few" is meaningful we need a null. Shuffling
     the presence/absence labels across the tree tips 1,000 times gives the
@@ -73,6 +73,12 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+# Shared AMR classification (marker list + reporting vocabulary) lives in
+# amr_common.py, so scripts 02 and 06 cannot drift apart on how a gene is
+# classified or how a pattern is named.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from amr_common import classify_pattern, is_acquired  # noqa: E402
 
 ANI_K = 31
 ANI_SCALED = 1000
@@ -196,7 +202,7 @@ def main() -> int:
     args = ap.parse_args()
 
     out = args.results
-    hits_path = out / "amr_hits.csv"
+    hits_path = out / "amr_genes.csv"
     tree_path = out / "core_genome.nwk"
     if not hits_path.exists():
         print(f"ERROR: {hits_path} not found -- run script 02 first.", file=sys.stderr)
@@ -231,10 +237,34 @@ def main() -> int:
 
     # ---- 3. gene presence per isolate --------------------------------------
     hits = pd.read_csv(hits_path)
-    acq = hits[(hits["database"] == "CARD") & (hits["acquired"] == True)]
+    card = hits[hits["database"] == "CARD"].copy()
+    # Every CARD gene is tested, not just the ones flagged acquired. The
+    # classification is carried through as a column so the table records
+    # which genes are intrinsic AND how each one is distributed.
+    card["acquired"] = card["gene"].map(is_acquired)
+    gene_is_acquired = dict(zip(card["gene"], card["acquired"]))
+    acq = card
     presence: dict[str, set[str]] = defaultdict(set)
     for _, r in acq.iterrows():
         presence[r["gene"]].add(r["strain"])
+
+    # Newick writers cannot carry underscores literally, and readers commonly
+    # turn them into spaces -- so tree tips ("GCA 000192125.1") and the strain
+    # column ("GCA_000192125.1") can disagree on the separator. Match on a
+    # canonical form. If NOTHING matches, every presence vector is all-zero and
+    # the test quietly reports "no test" for every gene, so fail loudly instead.
+    tip_key = {t: str(t).replace(" ", "_") for t in tip_names}
+    strain_labels = set(hits["strain"].astype(str))
+    matched = sum(1 for k in tip_key.values() if k in strain_labels)
+    if matched == 0:
+        print(f"ERROR: none of the {len(tip_names)} tree tips match any of the "
+              f"{len(strain_labels)} strain labels (e.g. tip={tip_names[0]!r} vs "
+              f"strain={sorted(strain_labels)[0]!r}). Refusing to run -- every "
+              f"gene would be reported as untestable.", file=sys.stderr)
+        return 1
+    if matched < len(tip_names):
+        print(f"  NOTE: {len(tip_names) - matched} tip(s) have no matching strain "
+              f"label and are treated as absent.")
 
     # ---- 4. host groups ----------------------------------------------------
     meta = pd.read_csv(args.metadata)
@@ -252,7 +282,7 @@ def main() -> int:
 
     # ---- 5. per-gene sharing + signal test ---------------------------------
     sharing_rows, signal_rows, pattern_rows = [], [], []
-    print(f"\nTesting {len(presence)} acquired AMR genes "
+    print(f"\nTesting {len(presence)} CARD AMR genes "
           f"({args.perms:,} permutations each) ...")
 
     for gene in sorted(presence):
@@ -266,26 +296,25 @@ def main() -> int:
         n_hosts = sum(1 for h in host_groups if counts[h] > 0)
 
         sharing_rows.append({"gene": gene, **counts,
-                             "n_hosts": n_hosts, "acquired": True})
+                             "n_hosts": n_hosts,
+                             "acquired": gene_is_acquired[gene]})
 
         # Fitch + permutation null
-        observed = {t: (1 if t in carriers else 0) for t in tip_names}
+        carriers_c = {str(c).replace(" ", "_") for c in carriers}
+        observed = {t: (1 if tip_key[t] in carriers_c else 0) for t in tip_names}
         changes_obs, p_clumped, expected = permutation_test(
             tree, tip_names, observed, args.perms, rng)
 
-        signal_rows.append({"gene": gene, "acquired": True,
+        signal_rows.append({"gene": gene, "acquired": gene_is_acquired[gene],
                             "n_isolates": len(carriers), "n_hosts": n_hosts,
                             "changes_observed": changes_obs,
                             "changes_expected": r2(expected),
                             "p_clumped": r2(p_clumped, 4)})
 
-        if np.isnan(p_clumped):
-            pattern = "invariant (no test)"
-        elif p_clumped < CLUMPED_ALPHA:
-            pattern = "clumped (inherited)"
-        else:
-            pattern = "dispersed (not explained by tree)"
-        pattern_rows.append({"gene": gene, "acquired": True,
+        # Single-carrier genes carry no phylogenetic information, so they are
+        # labelled uninformative before the p-value is considered.
+        pattern = classify_pattern(len(carriers), p_clumped)
+        pattern_rows.append({"gene": gene, "acquired": gene_is_acquired[gene],
                              "n_isolates": len(carriers), "n_hosts": n_hosts,
                              "changes_observed": changes_obs,
                              "changes_expected": r2(expected),
@@ -299,7 +328,7 @@ def main() -> int:
     pat_df.to_csv(out / "amr_inherited_vs_acquired.csv", index=False)
 
     # ---- 6. per-isolate one-health summary ---------------------------------
-    repl_path = out / "plasmid_replicons.csv"
+    repl_path = out / "plasmid_replicons_all.csv"
     repl_by_strain: dict[str, list[str]] = defaultdict(list)
     if repl_path.exists():
         rdf = pd.read_csv(repl_path)
@@ -347,7 +376,7 @@ def main() -> int:
             print(f"  results/{f}")
 
     print("\nCAVEAT: 'clumped' is consistent with inheritance but is not proof;")
-    print("        'dispersed' means only 'not explained by this tree'. Clonality")
+    print("        'scattered' means the tree does not explain it; that is consistent with\n        repeated acquisition, but clonal expansion can also flatten the signal. Clonality")
     print("        among the isolates is the main confounder. See README.")
     return 0
 
